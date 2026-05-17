@@ -16,11 +16,26 @@ SharedPreferences? prefs;
 // Globale Einstellungen
 double globalLightPreStart = 15.0;
 bool globalLucidEnabled = false;
-bool isFirstLaunch = true; // NEU: Prüft, ob die App zum ersten Mal startet
+bool isFirstLaunch = true;
 
 // Der Echtzeit-Schalter für das Logo
 ValueNotifier<bool> isSunriseActive = ValueNotifier(false);
 bool isTestingSunrise = false; 
+
+// --- BLE VERBINDUNG ---
+BluetoothDevice? connectedDevice;
+BluetoothCharacteristic? alarmCharacteristic;
+BluetoothCharacteristic? settingsCharacteristic;
+BluetoothCharacteristic? timeSyncCharacteristic;
+
+// BLE UUIDs (müssen mit ESP32 übereinstimmen!)
+const String SERVICE_UUID = "12345678-1234-1234-1234-123456789012";
+const String ALARM_CHAR_UUID = "87654321-4321-4321-4321-210987654321";
+const String SETTINGS_CHAR_UUID = "11111111-2222-3333-4444-555555555555";
+const String TIME_SYNC_CHAR_UUID = "99999999-9999-9999-9999-999999999999";
+
+ValueNotifier<bool> isConnectedToBLE = ValueNotifier(false);
+Timer? timeSyncTimer;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,10 +45,8 @@ void main() async {
 }
 
 void _loadData() {
-  // Check Onboarding
   isFirstLaunch = prefs?.getBool('isFirstLaunch') ?? true;
-
-  // Check Alarme
+  
   String? alarmsJson = prefs?.getString('alarms');
   if (alarmsJson != null) {
     List<dynamic> decoded = jsonDecode(alarmsJson);
@@ -45,18 +58,192 @@ void _loadData() {
     myAlarms = [{'time': '07:00', 'label': 'Guten Morgen', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}];
   }
   
-  // Check Settings
   globalLightPreStart = prefs?.getDouble('lightPreStart') ?? 15.0;
   globalLucidEnabled = prefs?.getBool('lucidEnabled') ?? false;
 }
 
-void saveAlarms() { prefs?.setString('alarms', jsonEncode(myAlarms)); }
+void saveAlarms() { 
+  prefs?.setString('alarms', jsonEncode(myAlarms));
+  // Sende Alarme zum ESP32
+  _sendAllAlarmsToESP32();
+}
+
 void saveSettings() {
   prefs?.setDouble('lightPreStart', globalLightPreStart);
   prefs?.setBool('lucidEnabled', globalLucidEnabled);
+  // Sende Settings zum ESP32
+  _sendSettingsToESP32();
 }
+
 void completeOnboarding() {
   prefs?.setBool('isFirstLaunch', false);
+}
+
+// --- BLE FUNKTIONEN ---
+
+/// Sende alle aktiven Alarme zum ESP32
+Future<void> _sendAllAlarmsToESP32() async {
+  if (alarmCharacteristic == null || !isConnectedToBLE.value) {
+    print("[BLE] ⚠️ Nicht verbunden - Alarme können nicht gesendet werden");
+    return;
+  }
+
+  for (var alarm in myAlarms) {
+    if (alarm['isActive'] == true) {
+      await _sendAlarmToESP32(alarm['time'], alarm['isActive']);
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+  }
+}
+
+/// Sende einen einzelnen Alarm zum ESP32
+Future<void> _sendAlarmToESP32(String time, bool enabled) async {
+  if (alarmCharacteristic == null || !isConnectedToBLE.value) {
+    print("[BLE] ⚠️ Nicht verbunden - Alarm kann nicht gesendet werden");
+    return;
+  }
+
+  try {
+    Map<String, dynamic> alarmData = {
+      'time': time,
+      'enabled': enabled ? 'true' : 'false'
+    };
+    String jsonData = jsonEncode(alarmData);
+    
+    List<int> bytes = utf8.encode(jsonData);
+    await alarmCharacteristic!.write(bytes, withoutResponse: false);
+    
+    print("[BLE] ✓ Alarm gesendet: $jsonData");
+  } catch (e) {
+    print("[BLE] ❌ Fehler beim Senden des Alarms: $e");
+  }
+}
+
+/// Sende Settings (Licht-Vorlauf) zum ESP32
+Future<void> _sendSettingsToESP32() async {
+  if (settingsCharacteristic == null || !isConnectedToBLE.value) {
+    print("[BLE] ⚠️ Nicht verbunden - Settings können nicht gesendet werden");
+    return;
+  }
+
+  try {
+    Map<String, dynamic> settingsData = {
+      'prestart': globalLightPreStart.toInt(),
+      'lucid': globalLucidEnabled ? 'true' : 'false'
+    };
+    String jsonData = jsonEncode(settingsData);
+    
+    List<int> bytes = utf8.encode(jsonData);
+    await settingsCharacteristic!.write(bytes, withoutResponse: false);
+    
+    print("[BLE] ✓ Settings gesendet: $jsonData");
+  } catch (e) {
+    print("[BLE] ❌ Fehler beim Senden der Settings: $e");
+  }
+}
+
+/// Synchronisiere Uhrzeit mit ESP32 (Format: "HH:MM")
+Future<void> _syncTimeWithESP32() async {
+  if (timeSyncCharacteristic == null || !isConnectedToBLE.value) {
+    print("[BLE] ⚠️ Nicht verbunden - Zeit kann nicht synchronisiert werden");
+    return;
+  }
+
+  try {
+    final now = DateTime.now();
+    String timeString = '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    
+    List<int> bytes = utf8.encode(timeString);
+    await timeSyncCharacteristic!.write(bytes, withoutResponse: false);
+    
+    print("[BLE] ✓ Zeit synchronisiert: $timeString");
+  } catch (e) {
+    print("[BLE] ❌ Fehler beim Synchronisieren der Zeit: $e");
+  }
+}
+
+/// Starte Timer zur regelmäßigen Zeitsynchronisation
+void _startTimeSyncTimer() {
+  timeSyncTimer?.cancel();
+  
+  _syncTimeWithESP32();
+  
+  timeSyncTimer = Timer.periodic(const Duration(seconds: 60), (timer) {
+    if (isConnectedToBLE.value) {
+      _syncTimeWithESP32();
+    }
+  });
+}
+
+/// Suche nach und verbinde mit ESP32
+Future<void> connectToESP32(BluetoothDevice device) async {
+  try {
+    print("[BLE] Verbinde zu ${device.name}...");
+    await device.connect();
+    
+    connectedDevice = device;
+    isConnectedToBLE.value = true;
+    
+    print("[BLE] ✓ Verbunden zu ${device.name}");
+
+    List<BluetoothService> services = await device.discoverServices();
+    
+    for (BluetoothService service in services) {
+      if (service.uuid.toString().toLowerCase() == SERVICE_UUID.toLowerCase()) {
+        print("[BLE] Service gefunden!");
+        
+        for (BluetoothCharacteristic characteristic in service.characteristics) {
+          String charUUID = characteristic.uuid.toString().toLowerCase();
+          
+          if (charUUID == ALARM_CHAR_UUID.toLowerCase()) {
+            alarmCharacteristic = characteristic;
+            print("[BLE] Alarm Characteristic gefunden");
+          }
+          if (charUUID == SETTINGS_CHAR_UUID.toLowerCase()) {
+            settingsCharacteristic = characteristic;
+            print("[BLE] Settings Characteristic gefunden");
+          }
+          if (charUUID == TIME_SYNC_CHAR_UUID.toLowerCase()) {
+            timeSyncCharacteristic = characteristic;
+            print("[BLE] Time Sync Characteristic gefunden");
+          }
+        }
+      }
+    }
+
+    await Future.delayed(const Duration(milliseconds: 500));
+    await _syncTimeWithESP32();
+    await Future.delayed(const Duration(milliseconds: 200));
+    await _sendSettingsToESP32();
+    await Future.delayed(const Duration(milliseconds: 200));
+    await _sendAllAlarmsToESP32();
+    
+    _startTimeSyncTimer();
+    
+  } catch (e) {
+    print("[BLE] ❌ Verbindungsfehler: $e");
+    isConnectedToBLE.value = false;
+  }
+}
+
+/// Trenne Verbindung vom ESP32
+Future<void> disconnectFromESP32() async {
+  try {
+    if (connectedDevice != null) {
+      await connectedDevice!.disconnect();
+      print("[BLE] ✓ Verbindung getrennt");
+    }
+    
+    connectedDevice = null;
+    alarmCharacteristic = null;
+    settingsCharacteristic = null;
+    timeSyncCharacteristic = null;
+    isConnectedToBLE.value = false;
+    
+    timeSyncTimer?.cancel();
+  } catch (e) {
+    print("[BLE] ❌ Fehler beim Trennen: $e");
+  }
 }
 
 // --- DAS SONILLO LOGO ---
@@ -89,11 +276,16 @@ class SonilloApp extends StatelessWidget {
     return MaterialApp(
       title: 'Sonillo Premium',
       theme: ThemeData(
-        brightness: Brightness.dark, primaryColor: const Color(0xFF6C63FF), scaffoldBackgroundColor: const Color(0xFF0A0A0A),
+        brightness: Brightness.dark, 
+        primaryColor: const Color(0xFF6C63FF), 
+        scaffoldBackgroundColor: const Color(0xFF0A0A0A),
         appBarTheme: const AppBarTheme(backgroundColor: Colors.transparent, elevation: 0, centerTitle: true),
-        bottomNavigationBarTheme: const BottomNavigationBarThemeData(backgroundColor: Color(0xFF1A1A1A), selectedItemColor: Color(0xFF6C63FF), unselectedItemColor: Colors.grey, type: BottomNavigationBarType.fixed),
+        bottomNavigationBarTheme: const BottomNavigationBarThemeData(
+          backgroundColor: Color(0xFF1A1A1A), 
+          selectedItemColor: Color(0xFF6C63FF), 
+          unselectedItemColor: Colors.grey
+        ),
       ),
-      // DER WEICHENSTELLER: Onboarding oder direkt zur App?
       home: isFirstLaunch ? const OnboardingScreen() : const MainNavigationScreen(),
       debugShowCheckedModeBanner: false,
     );
@@ -127,30 +319,31 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             onPageChanged: (int page) => setState(() => _currentPage = page),
             children: [
               _buildPage(
-                icon: Icons.bedtime, color: const Color(0xFF6C63FF),
+                icon: Icons.bedtime, 
+                color: const Color(0xFF6C63FF),
                 title: 'Willkommen bei Sonillo',
                 description: 'Verabschiede dich von schrillen Weckern. Erlebe die sanfteste Art, in den Tag zu starten.',
               ),
               _buildPage(
-                icon: Icons.bluetooth_connected, color: Colors.blueAccent,
+                icon: Icons.bluetooth_connected, 
+                color: Colors.blueAccent,
                 title: 'Smart & Verbunden',
                 description: 'Kopple deine Sonillo Maske über den Radar-Tab, um das volle Potenzial deines Schlafs freizuschalten.',
               ),
               _buildPage(
-                icon: Icons.wb_twilight, color: Colors.orangeAccent,
+                icon: Icons.wb_twilight, 
+                color: Colors.orangeAccent,
                 title: 'Dein persönlicher Sonnenaufgang',
                 description: 'Die Maske dimmt das Licht langsam hoch, bevor dein Wecker klingelt. Du wachst erholt auf.',
               ),
             ],
           ),
           
-          // Navigation unten (Punkte & Button)
           Positioned(
             bottom: 50, left: 20, right: 20,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // Die kleinen Punkte
                 Row(
                   children: List.generate(3, (index) => AnimatedContainer(
                     duration: const Duration(milliseconds: 300),
@@ -164,7 +357,6 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   )),
                 ),
                 
-                // Der Weiter / Start Button
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF6C63FF),
@@ -173,7 +365,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   ),
                   onPressed: () {
                     if (_currentPage == 2) {
-                      _finishOnboarding(); // App starten!
+                      _finishOnboarding();
                     } else {
                       _pageController.nextPage(duration: const Duration(milliseconds: 500), curve: Curves.ease);
                     }
@@ -218,7 +410,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   Timer? _heartbeat;
 
   final List<Widget> _pages = [
-    const AlarmScreen(), const SleepSoundScreen(), const StatsScreen(), const MaskSettingsScreen(),
+    const AlarmScreen(), 
+    const SleepSoundScreen(), 
+    const StatsScreen(), 
+    const MaskSettingsScreen(),
   ];
 
   @override
@@ -277,9 +472,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
     if (!mounted) return;
     showDialog(
-      context: context, barrierDismissible: false, 
+      context: context, 
+      barrierDismissible: false, 
       builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        backgroundColor: const Color(0xFF1A1A1A), 
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         title: Column(
           children: [
             const SonilloLogo(), 
@@ -297,7 +494,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 width: double.infinity,
                 child: OutlinedButton.icon(
                   icon: const Icon(Icons.snooze),
-                  style: OutlinedButton.styleFrom(foregroundColor: Colors.white, side: const BorderSide(color: Colors.grey), padding: const EdgeInsets.symmetric(vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white, 
+                    side: const BorderSide(color: Colors.grey), 
+                    padding: const EdgeInsets.symmetric(vertical: 15), 
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                  ),
                   onPressed: () {
                     FlutterRingtonePlayer().stop();
                     Vibration.cancel();
@@ -315,7 +517,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6C63FF), padding: const EdgeInsets.symmetric(vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF6C63FF), 
+                    padding: const EdgeInsets.symmetric(vertical: 15), 
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                  ),
                   onPressed: () {
                     FlutterRingtonePlayer().stop();
                     Vibration.cancel(); 
@@ -332,7 +538,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   }
 
   @override
-  void dispose() { _heartbeat?.cancel(); super.dispose(); }
+  void dispose() { 
+    _heartbeat?.cancel(); 
+    super.dispose(); 
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -369,32 +578,58 @@ class _AlarmScreenState extends State<AlarmScreen> {
       context: context,
       builder: (BuildContext builder) {
         return Dialog(
-          backgroundColor: const Color(0xFF1A1A1A), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          backgroundColor: const Color(0xFF1A1A1A), 
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           child: Container(
-            width: 350, padding: const EdgeInsets.all(20),
+            width: 350, 
+            padding: const EdgeInsets.all(20),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen', style: TextStyle(color: Colors.grey, fontSize: 16))),
+                    TextButton(
+                      onPressed: () => Navigator.pop(context), 
+                      child: const Text('Abbrechen', style: TextStyle(color: Colors.grey, fontSize: 16))
+                    ),
                     TextButton(
                       onPressed: () {
                         String formattedTime = '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}';
                         String alarmName = nameController.text.trim();
                         if (alarmName.isEmpty) alarmName = "Wecker"; 
                         setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': alarmName, 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}); });
-                        saveAlarms(); Navigator.pop(context); 
+                        saveAlarms(); 
+                        Navigator.pop(context); 
                       },
                       child: const Text('Speichern', style: TextStyle(color: Color(0xFF6C63FF), fontSize: 16, fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
                 const SizedBox(height: 15),
-                TextField(controller: nameController, style: const TextStyle(color: Colors.white, fontSize: 18), decoration: InputDecoration(labelText: 'Name', labelStyle: const TextStyle(color: Colors.grey), prefixIcon: const Icon(Icons.edit, color: Colors.grey), filled: true, fillColor: const Color(0xFF2A2A2A), border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none))),
+                TextField(
+                  controller: nameController, 
+                  style: const TextStyle(color: Colors.white, fontSize: 18), 
+                  decoration: InputDecoration(
+                    labelText: 'Name', 
+                    labelStyle: const TextStyle(color: Colors.grey),
+                    enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFF6C63FF)))
+                  ),
+                ),
                 const SizedBox(height: 25), 
-                SizedBox(height: 200, child: CupertinoTheme(data: const CupertinoThemeData(brightness: Brightness.dark), child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, use24hFormat: true, initialDateTime: DateTime.now(), onDateTimeChanged: (newTime) => selectedTime = newTime))),
+                SizedBox(
+                  height: 200, 
+                  child: CupertinoTheme(
+                    data: const CupertinoThemeData(brightness: Brightness.dark), 
+                    child: CupertinoDatePicker(
+                      mode: CupertinoDatePickerMode.time, 
+                      use24hFormat: true,
+                      onDateTimeChanged: (DateTime newDate) {
+                        selectedTime = newDate;
+                      },
+                    ),
+                  ),
+                )
               ],
             ),
           ),
@@ -408,49 +643,132 @@ class _AlarmScreenState extends State<AlarmScreen> {
     String formattedTime = '${wakeUpTime.hour.toString().padLeft(2, '0')}:${wakeUpTime.minute.toString().padLeft(2, '0')}';
     setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': 'Powernap ($minutes Min)', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}); });
     saveAlarms(); 
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Powernap auf $formattedTime Uhr'), backgroundColor: const Color(0xFF6C63FF)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('Powernap auf $formattedTime Uhr'), 
+      backgroundColor: const Color(0xFF6C63FF)
+    ));
   }
 
-  void _toggleAlarm(int index, bool newValue) { setState(() { myAlarms[index]['isActive'] = newValue; }); saveAlarms(); }
-  void _deleteAlarm(int index) { setState(() { myAlarms.removeAt(index); }); saveAlarms(); }
+  void _toggleAlarm(int index, bool newValue) { 
+    setState(() { myAlarms[index]['isActive'] = newValue; }); 
+    saveAlarms(); 
+  }
+
+  void _deleteAlarm(int index) { 
+    setState(() { myAlarms.removeAt(index); }); 
+    saveAlarms(); 
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const SonilloLogo(), 
-        actions: [IconButton(icon: const Icon(Icons.bluetooth_searching, color: Color(0xFF6C63FF)), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ScanScreen()))), const SizedBox(width: 10)],
+        actions: [
+          ValueListenableBuilder<bool>(
+            valueListenable: isConnectedToBLE,
+            builder: (context, isConnected, child) {
+              return IconButton(
+                icon: Icon(
+                  Icons.bluetooth_searching, 
+                  color: isConnected ? Colors.greenAccent : const Color(0xFF6C63FF)
+                ), 
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ScanScreen()))
+              );
+            },
+          )
+        ],
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          for (int i = 0; i < myAlarms.length; i++) _buildAlarmCard(myAlarms[i]['time'], myAlarms[i]['label'], myAlarms[i]['isActive'], i),
-          const SizedBox(height: 30), const Text('Sonillo Schnellstart', style: TextStyle(color: Colors.grey, fontSize: 14)), const SizedBox(height: 10),
-          Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [_buildPowernapButton(1), _buildPowernapButton(15), _buildPowernapButton(30)]),
+          for (int i = 0; i < myAlarms.length; i++) 
+            _buildAlarmCard(myAlarms[i]['time'], myAlarms[i]['label'], myAlarms[i]['isActive'], i),
+          const SizedBox(height: 30), 
+          const Text('Sonillo Schnellstart', style: TextStyle(color: Colors.grey, fontSize: 14)), 
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly, 
+            children: [
+              _buildPowernapButton(1), 
+              _buildPowernapButton(15), 
+              _buildPowernapButton(30)
+            ]
+          ),
           const SizedBox(height: 20),
-          ElevatedButton.icon(onPressed: _showIOSStyleTimePicker, icon: const Icon(Icons.add), label: const Text('Neuen Alarm stellen', style: TextStyle(fontSize: 16)), style: ElevatedButton.styleFrom(padding: const EdgeInsets.all(16), backgroundColor: const Color(0xFF2A2A2A), foregroundColor: const Color(0xFF6C63FF), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)))),
+          ElevatedButton.icon(
+            onPressed: _showIOSStyleTimePicker, 
+            icon: const Icon(Icons.add), 
+            label: const Text('Neuen Alarm stellen', style: TextStyle(fontSize: 16)), 
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF6C63FF), 
+              padding: const EdgeInsets.symmetric(vertical: 15),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+            ),
+          )
         ],
       ),
     );
   }
 
   Widget _buildPowernapButton(int minutes) {
-    return ActionChip(label: Text('$minutes Min'), backgroundColor: const Color(0xFF1A1A1A), labelStyle: const TextStyle(color: Colors.white), side: const BorderSide(color: Color(0xFF6C63FF)), onPressed: () => _startPowernap(minutes));
+    return ActionChip(
+      label: Text('$minutes Min'), 
+      backgroundColor: const Color(0xFF1A1A1A), 
+      labelStyle: const TextStyle(color: Colors.white), 
+      side: const BorderSide(color: Color(0xFF6C63FF)), 
+      onPressed: () => _startPowernap(minutes)
+    );
   }
 
   Widget _buildAlarmCard(String time, String label, bool isActive, int index) {
     return Dismissible(
-      key: UniqueKey(), direction: DismissDirection.endToStart, onDismissed: (_) => _deleteAlarm(index),
-      background: Container(alignment: Alignment.centerRight, padding: const EdgeInsets.only(right: 20), decoration: BoxDecoration(color: Colors.redAccent, borderRadius: BorderRadius.circular(20)), child: const Icon(Icons.delete, color: Colors.white)),
+      key: UniqueKey(), 
+      direction: DismissDirection.endToStart, 
+      onDismissed: (_) => _deleteAlarm(index),
+      background: Container(
+        alignment: Alignment.centerRight, 
+        padding: const EdgeInsets.only(right: 20), 
+        decoration: BoxDecoration(
+          color: Colors.redAccent, 
+          borderRadius: BorderRadius.circular(20)
+        ),
+        child: const Icon(Icons.delete, color: Colors.white),
+      ),
       child: Card(
-        color: const Color(0xFF1A1A1A), margin: const EdgeInsets.only(bottom: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        color: const Color(0xFF1A1A1A), 
+        margin: const EdgeInsets.only(bottom: 16), 
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(time, style: TextStyle(fontSize: 40, fontWeight: FontWeight.bold, color: isActive ? Colors.white : Colors.grey.shade700)), Text(label, style: const TextStyle(color: Colors.grey, fontSize: 16))]),
-              Switch(value: isActive, activeColor: const Color(0xFF6C63FF), onChanged: (val) => _toggleAlarm(index, val)),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start, 
+                children: [
+                  Text(
+                    time, 
+                    style: TextStyle(
+                      fontSize: 40, 
+                      fontWeight: FontWeight.bold, 
+                      color: isActive ? Colors.white : Colors.grey.shade600
+                    )
+                  ),
+                  Text(
+                    label, 
+                    style: TextStyle(
+                      fontSize: 14, 
+                      color: isActive ? Colors.grey : Colors.grey.shade700
+                    )
+                  ),
+                ]
+              ),
+              Switch(
+                value: isActive, 
+                activeColor: const Color(0xFF6C63FF), 
+                onChanged: (val) => _toggleAlarm(index, val)
+              ),
             ],
           ),
         ),
@@ -511,7 +829,11 @@ class _SleepSoundScreenState extends State<SleepSoundScreen> {
               padding: const EdgeInsets.all(16.0),
               child: Container(
                 padding: const EdgeInsets.all(15),
-                decoration: BoxDecoration(color: const Color(0xFF6C63FF).withOpacity(0.2), borderRadius: BorderRadius.circular(15), border: Border.all(color: const Color(0xFF6C63FF))),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF6C63FF).withOpacity(0.2), 
+                  borderRadius: BorderRadius.circular(15), 
+                  border: Border.all(color: const Color(0xFF6C63FF))
+                ),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
@@ -523,7 +845,10 @@ class _SleepSoundScreenState extends State<SleepSoundScreen> {
             ),
           Expanded(
             child: GridView.count(
-              crossAxisCount: 2, padding: const EdgeInsets.all(16), crossAxisSpacing: 16, mainAxisSpacing: 16,
+              crossAxisCount: 2, 
+              padding: const EdgeInsets.all(16), 
+              crossAxisSpacing: 16, 
+              mainAxisSpacing: 16,
               children: [
                 _buildSoundCard(0, Icons.water_drop, 'Sanfter Regen'),
                 _buildSoundCard(1, Icons.air, 'White Noise'),
@@ -552,7 +877,14 @@ class _SleepSoundScreenState extends State<SleepSoundScreen> {
           children: [
             Icon(icon, size: 50, color: isSelected ? const Color(0xFF6C63FF) : Colors.white),
             const SizedBox(height: 10),
-            Text(title, style: TextStyle(fontSize: 16, color: isSelected ? const Color(0xFF6C63FF) : Colors.white, fontWeight: FontWeight.bold)),
+            Text(
+              title, 
+              style: TextStyle(
+                fontSize: 16, 
+                color: isSelected ? const Color(0xFF6C63FF) : Colors.white, 
+                fontWeight: FontWeight.bold
+              )
+            ),
           ],
         ),
       ),
@@ -578,30 +910,75 @@ class StatsScreen extends StatelessWidget {
             const Text('Ø 7h 20m Schlafenszeit', style: TextStyle(color: Colors.grey, fontSize: 16)),
             const SizedBox(height: 30),
             Container(
-              height: 250, padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: const Color(0xFF1A1A1A), borderRadius: BorderRadius.circular(20)),
+              height: 250, 
+              padding: const EdgeInsets.all(16), 
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A1A1A), 
+                borderRadius: BorderRadius.circular(20)
+              ),
               child: BarChart(
                 BarChartData(
-                  alignment: BarChartAlignment.spaceAround, maxY: 10, barTouchData: BarTouchData(enabled: false),
+                  alignment: BarChartAlignment.spaceAround, 
+                  maxY: 10, 
+                  barTouchData: BarTouchData(enabled: false),
                   titlesData: FlTitlesData(
-                    show: true, bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, getTitlesWidget: (double value, TitleMeta meta) {
+                    show: true, 
+                    bottomTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true, 
+                        getTitlesWidget: (double value, TitleMeta meta) {
                           const style = TextStyle(color: Colors.grey, fontSize: 12);
                           String text;
-                          switch (value.toInt()) { case 0: text='Mo'; break; case 1: text='Di'; break; case 2: text='Mi'; break; case 3: text='Do'; break; case 4: text='Fr'; break; case 5: text='Sa'; break; case 6: text='So'; break; default: text=''; break; }
+                          switch (value.toInt()) { 
+                            case 0: text='Mo'; break; 
+                            case 1: text='Di'; break; 
+                            case 2: text='Mi'; break; 
+                            case 3: text='Do'; break; 
+                            case 4: text='Fr'; break; 
+                            case 5: text='Sa'; break;
+                            case 6: text='So'; break;
+                            default: text=''; break;
+                          }
                           return SideTitleWidget(meta: meta, child: Text(text, style: style));
                         },
                       ),
                     ),
-                    leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)), topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)), rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                    leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)), 
+                    topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)), 
+                    rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   ),
-                  gridData: FlGridData(show: true, drawVerticalLine: false, horizontalInterval: 2, getDrawingHorizontalLine: (value) => FlLine(color: Colors.grey.withOpacity(0.2), strokeWidth: 1)),
+                  gridData: FlGridData(
+                    show: true, 
+                    drawVerticalLine: false, 
+                    horizontalInterval: 2, 
+                    getDrawingHorizontalLine: (value) => FlLine(
+                      color: Colors.grey.withOpacity(0.2), 
+                      strokeWidth: 1
+                    )
+                  ),
                   borderData: FlBorderData(show: false),
-                  barGroups: [_makeBarData(0, 6.5), _makeBarData(1, 7.0), _makeBarData(2, 5.5), _makeBarData(3, 8.0), _makeBarData(4, 7.5), _makeBarData(5, 9.0), _makeBarData(6, 8.5)],
+                  barGroups: [
+                    _makeBarData(0, 6.5), 
+                    _makeBarData(1, 7.0), 
+                    _makeBarData(2, 5.5), 
+                    _makeBarData(3, 8.0), 
+                    _makeBarData(4, 7.5), 
+                    _makeBarData(5, 9.0), 
+                    _makeBarData(6, 8.5)
+                  ],
                 ),
               ),
             ),
             const SizedBox(height: 30),
-            const Text('Erfolge', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)), const SizedBox(height: 15),
-            ListTile(contentPadding: const EdgeInsets.all(15), tileColor: const Color(0xFF1A1A1A), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)), leading: const Icon(Icons.local_fire_department, color: Colors.orange, size: 40), title: const Text('3 Tage Streak!', style: TextStyle(fontWeight: FontWeight.bold)), subtitle: const Text('Du bist pünktlich ins Bett gegangen.'))
+            const Text('Erfolge', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)), 
+            const SizedBox(height: 15),
+            ListTile(
+              contentPadding: const EdgeInsets.all(15), 
+              tileColor: const Color(0xFF1A1A1A), 
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)), 
+              leading: const Icon(Icons.check_circle, color: Colors.green),
+              title: const Text('7 Tage in Folge', style: TextStyle(fontWeight: FontWeight.bold)),
+            )
           ],
         ),
       ),
@@ -609,7 +986,20 @@ class StatsScreen extends StatelessWidget {
   }
 
   BarChartGroupData _makeBarData(int x, double y) {
-    return BarChartGroupData(x: x, barRods: [BarChartRodData(toY: y, color: const Color(0xFF6C63FF), width: 15, borderRadius: const BorderRadius.only(topLeft: Radius.circular(5), topRight: Radius.circular(5)), backDrawRodData: BackgroundBarChartRodData(show: true, toY: 10, color: const Color(0xFF2A2A2A)))]);
+    return BarChartGroupData(
+      x: x, 
+      barRods: [
+        BarChartRodData(
+          toY: y, 
+          color: const Color(0xFF6C63FF), 
+          width: 15, 
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(5), 
+            topRight: Radius.circular(5)
+          )
+        )
+      ]
+    );
   }
 }
 
@@ -631,7 +1021,25 @@ class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const ListTile(leading: Icon(Icons.battery_4_bar, color: Colors.green), title: Text('Akku der Sonillo Maske'), trailing: Text('85%', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold))),
+          ValueListenableBuilder<bool>(
+            valueListenable: isConnectedToBLE,
+            builder: (context, isConnected, child) {
+              return ListTile(
+                leading: Icon(
+                  Icons.battery_4_bar, 
+                  color: isConnected ? Colors.green : Colors.grey
+                ), 
+                title: const Text('Sonillo Maske Verbindung'), 
+                trailing: Text(
+                  isConnected ? 'Verbunden ✓' : 'Nicht verbunden',
+                  style: TextStyle(
+                    color: isConnected ? Colors.green : Colors.red, 
+                    fontWeight: FontWeight.bold
+                  ),
+                ),
+              );
+            },
+          ),
           const Divider(color: Colors.grey),
           
           Container(
@@ -640,8 +1048,10 @@ class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
               icon: const Icon(Icons.wb_twilight),
               label: const Text('Signal-Test: Logo-Farbe testen'),
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF2A2A2A), foregroundColor: Colors.orangeAccent,
-                padding: const EdgeInsets.all(15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                backgroundColor: const Color(0xFF2A2A2A), 
+                foregroundColor: Colors.orangeAccent,
+                padding: const EdgeInsets.all(15), 
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
               ),
               onPressed: () {
                 isTestingSunrise = true;
@@ -655,32 +1065,63 @@ class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
                     content: const Text('Sonillo Maske: Sonnenaufgang simuliert!'),
-                    backgroundColor: const Color(0xFF2A2A2A), behavior: SnackBarBehavior.floating, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)), duration: const Duration(seconds: 3),
+                    backgroundColor: const Color(0xFF2A2A2A), 
+                    behavior: SnackBarBehavior.floating, 
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)), 
+                    duration: const Duration(seconds: 3),
                   )
                 );
               },
             ),
           ),
 
-          SwitchListTile(title: const Text('Sonillo Premium-Einstellungen', style: TextStyle(fontWeight: FontWeight.bold)), subtitle: const Text('Klarträume, Licht-Vorlauf & mehr'), value: isAdvancedMode, activeColor: const Color(0xFF6C63FF), onChanged: (bool value) => setState(() => isAdvancedMode = value)),
+          SwitchListTile(
+            title: const Text('Sonillo Premium-Einstellungen', style: TextStyle(fontWeight: FontWeight.bold)), 
+            subtitle: const Text('Klarträume, Licht-Vorlauf & mehr'), 
+            value: isAdvancedMode,
+            activeColor: const Color(0xFF6C63FF),
+            onChanged: (bool value) => setState(() => isAdvancedMode = value),
+          ),
+          
           if (isAdvancedMode) ...[
             Container(
-              margin: const EdgeInsets.only(top: 10, bottom: 20), padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(color: const Color(0xFF1A1A1A), borderRadius: BorderRadius.circular(15), border: Border.all(color: const Color(0xFF6C63FF).withOpacity(0.5))),
+              margin: const EdgeInsets.only(top: 10, bottom: 20), 
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A1A1A), 
+                borderRadius: BorderRadius.circular(15), 
+                border: Border.all(color: const Color(0xFF6C63FF).withOpacity(0.5))
+              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text('Licht-Vorlaufzeit', style: TextStyle(color: Colors.grey, fontSize: 14)), 
-                  Text('Startet ${globalLightPreStart.toInt()} Min. vor dem Wecker', style: const TextStyle(fontSize: 16)),
+                  Text(
+                    'Startet ${globalLightPreStart.toInt()} Min. vor dem Wecker', 
+                    style: const TextStyle(fontSize: 16)
+                  ),
                   Slider(
-                    value: globalLightPreStart, min: 5, max: 45, divisions: 8, activeColor: const Color(0xFF6C63FF), 
-                    onChanged: (val) { setState(() => globalLightPreStart = val); saveSettings(); }
+                    value: globalLightPreStart, 
+                    min: 5, 
+                    max: 45, 
+                    divisions: 8, 
+                    activeColor: const Color(0xFF6C63FF), 
+                    onChanged: (val) { 
+                      setState(() => globalLightPreStart = val); 
+                      saveSettings(); 
+                    }
                   ),
                   const Divider(color: Colors.grey),
                   SwitchListTile(
-                    contentPadding: EdgeInsets.zero, title: const Text('Lucid Dream (Klartraum) Modus'), subtitle: const Text('Leichtes rotes Blitzen in der REM-Phase'), 
-                    value: globalLucidEnabled, activeColor: Colors.redAccent, 
-                    onChanged: (bool value) { setState(() => globalLucidEnabled = value); saveSettings(); }
+                    contentPadding: EdgeInsets.zero, 
+                    title: const Text('Lucid Dream (Klartraum) Modus'), 
+                    subtitle: const Text('Leichtes rotes Blitzen in der REM-Phase'), 
+                    value: globalLucidEnabled, 
+                    activeColor: Colors.redAccent, 
+                    onChanged: (bool value) { 
+                      setState(() => globalLucidEnabled = value); 
+                      saveSettings(); 
+                    }
                   ),
                 ],
               ),
@@ -713,27 +1154,125 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 
   Future<void> _checkPermissionsAndStart() async {
-    Map<Permission, PermissionStatus> statuses = await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
-    if (statuses[Permission.bluetoothScan]!.isGranted) _startScan();
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.bluetoothScan, 
+      Permission.bluetoothConnect, 
+      Permission.location
+    ].request();
+    
+    if (statuses[Permission.bluetoothScan]!.isGranted) {
+      _startScan();
+    }
   }
 
   void _startScan() async {
-    _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) { setState(() { _scanResults = results; }); });
-    _isScanningSubscription = FlutterBluePlus.isScanning.listen((state) { setState(() { _isScanning = state; }); });
-    try { await FlutterBluePlus.startScan(timeout: const Duration(seconds: 15)); } catch (e) { print("Scan Error: $e"); }
+    _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) { 
+      setState(() { _scanResults = results; }); 
+    });
+    _isScanningSubscription = FlutterBluePlus.isScanning.listen((state) { 
+      setState(() { _isScanning = state; }); 
+    });
+    try { 
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 15)); 
+    } catch (e) { 
+      print("Scan Error: $e"); 
+    }
   }
 
   @override
-  void dispose() { FlutterBluePlus.stopScan(); _scanResultsSubscription.cancel(); _isScanningSubscription.cancel(); super.dispose(); }
+  void dispose() { 
+    FlutterBluePlus.stopScan(); 
+    _scanResultsSubscription.cancel(); 
+    _isScanningSubscription.cancel(); 
+    super.dispose(); 
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const SonilloLogo(), backgroundColor: Colors.transparent),
+      appBar: AppBar(
+        title: const SonilloLogo(), 
+        backgroundColor: Colors.transparent
+      ),
       body: Column(
         children: [
-          Padding(padding: const EdgeInsets.all(20.0), child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [if (_isScanning) const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Color(0xFF6C63FF), strokeWidth: 3)), const SizedBox(width: 15), Text(_isScanning ? 'Suche nach Masken...' : 'Suche beendet.', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))])),
-          Expanded(child: _scanResults.isEmpty ? const Center(child: Text('Keine Geräte gefunden.\n(PC Emulator normal!)', textAlign: TextAlign.center)) : ListView.builder(itemCount: _scanResults.length, itemBuilder: (context, index) { final device = _scanResults[index].device; return ListTile(title: Text(device.advName.isEmpty ? 'Unbekannt' : device.advName), subtitle: Text(device.remoteId.toString())); })),
+          Padding(
+            padding: const EdgeInsets.all(20.0), 
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center, 
+              children: [
+                if (_isScanning) 
+                  const SizedBox(
+                    width: 20, 
+                    height: 20, 
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF6C63FF)),
+                    ),
+                  )
+                else
+                  const Icon(Icons.bluetooth_searching, color: Color(0xFF6C63FF)),
+                const SizedBox(width: 10),
+                Text(_isScanning ? 'Suche...' : 'Tap zum Scannen', style: const TextStyle(fontSize: 16)),
+              ]
+            ),
+          ),
+          Expanded(
+            child: _scanResults.isEmpty 
+              ? const Center(
+                  child: Text(
+                    'Keine Geräte gefunden.\n(Stelle sicher, dass die Sonillo Maske eingeschaltet ist)', 
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey),
+                  )
+                ) 
+              : ListView.builder(
+                  itemCount: _scanResults.length,
+                  itemBuilder: (context, index) {
+                    ScanResult result = _scanResults[index];
+                    return ListTile(
+                      leading: const Icon(Icons.bluetooth, color: Color(0xFF6C63FF)),
+                      title: Text(result.device.name.isEmpty ? 'Unbekanntes Gerät' : result.device.name),
+                      subtitle: Text(result.device.id.id),
+                      trailing: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF6C63FF),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))
+                        ),
+                        onPressed: () async {
+                          FlutterBluePlus.stopScan();
+                          await connectToESP32(result.device);
+                          
+                          if (mounted) {
+                            Navigator.pop(context);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text('Verbunden mit ${result.device.name}'),
+                                backgroundColor: Colors.green,
+                              )
+                            );
+                          }
+                        },
+                        child: const Text('Verbinden', style: TextStyle(color: Colors.white, fontSize: 12)),
+                      ),
+                      onTap: () async {
+                        FlutterBluePlus.stopScan();
+                        await connectToESP32(result.device);
+                        
+                        if (mounted) {
+                          Navigator.pop(context);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Verbunden mit ${result.device.name}'),
+                              backgroundColor: Colors.green,
+                            )
+                          );
+                        }
+                      },
+                    );
+                  },
+                ),
+          ),
         ],
       ),
     );
