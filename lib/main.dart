@@ -5,7 +5,7 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart'; 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart'; 
 import 'package:permission_handler/permission_handler.dart'; 
-import 'package:flutter_ringtone_player/flutter_ringtone_player.dart'; 
+import 'package:audioplayers/audioplayers.dart'; 
 import 'package:vibration/vibration.dart'; 
 import 'package:fl_chart/fl_chart.dart'; 
 
@@ -178,13 +178,13 @@ void _startTimeSyncTimer() {
 /// Suche nach und verbinde mit ESP32
 Future<void> connectToESP32(BluetoothDevice device) async {
   try {
-    print("[BLE] Verbinde zu ${device.name}...");
-    await device.connect();
+    print("[BLE] Verbinde zu ${device.platformName}...");
+    await device.connect(license: License.free);
     
     connectedDevice = device;
     isConnectedToBLE.value = true;
     
-    print("[BLE] ✓ Verbunden zu ${device.name}");
+    print("[BLE] ✓ Verbunden zu ${device.platformName}");
 
     List<BluetoothService> services = await device.discoverServices();
     
@@ -408,6 +408,7 @@ class MainNavigationScreen extends StatefulWidget {
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _currentIndex = 0;
   Timer? _heartbeat;
+  final AudioPlayer _audioPlayer = AudioPlayer();
 
   final List<Widget> _pages = [
     const AlarmScreen(), 
@@ -466,7 +467,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   }
 
   void _triggerAlarmScreen(String label) async {
-    FlutterRingtonePlayer().playAlarm(looping: true, volume: 1.0);
+    // --- BULLETPROOF BLUETOOTH AUDIO ---
+    // Nutzt den Standard-Medienkanal (wie Spotify), was Android zwingt, 
+    // den Ton über den verbundenen ESP32 abzuspielen.
+    _audioPlayer.setReleaseMode(ReleaseMode.loop);
+    await _audioPlayer.play(AssetSource('audio/alarm.mp3'));
+
     bool? hasVibrator = await Vibration.hasVibrator();
     if (hasVibrator == true) Vibration.vibrate(pattern: [500, 1000, 500, 1000], repeat: 1);
 
@@ -501,14 +507,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
                   ),
                   onPressed: () {
-                    FlutterRingtonePlayer().stop();
+                    _audioPlayer.stop();
                     Vibration.cancel();
                     Navigator.pop(context);
                     DateTime snoozeTime = DateTime.now().add(const Duration(minutes: 5));
                     String formattedSnooze = '${snoozeTime.hour.toString().padLeft(2, '0')}:${snoozeTime.minute.toString().padLeft(2, '0')}';
-                    setState(() { myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}); });
+                    myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''});
                     saveAlarms();
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: const Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
                   },
                   label: const Text('5 Min Snooze', style: TextStyle(fontSize: 16)),
                 ),
@@ -523,7 +529,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
                   ),
                   onPressed: () {
-                    FlutterRingtonePlayer().stop();
+                    _audioPlayer.stop();
                     Vibration.cancel(); 
                     Navigator.pop(context);
                   },
@@ -540,6 +546,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   @override
   void dispose() { 
     _heartbeat?.cancel(); 
+    _audioPlayer.dispose();
     super.dispose(); 
   }
 
@@ -939,7 +946,10 @@ class StatsScreen extends StatelessWidget {
                             case 6: text='So'; break;
                             default: text=''; break;
                           }
-                          return SideTitleWidget(meta: meta, child: Text(text, style: style));
+                          return SideTitleWidget(
+                           meta: meta, 
+                            child: Text(text, style: style),
+                          );
                         },
                       ),
                     ),
@@ -1144,8 +1154,8 @@ class ScanScreen extends StatefulWidget {
 class _ScanScreenState extends State<ScanScreen> {
   List<ScanResult> _scanResults = [];
   bool _isScanning = false;
-  late StreamSubscription<List<ScanResult>> _scanResultsSubscription;
-  late StreamSubscription<bool> _isScanningSubscription;
+  StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
+  StreamSubscription<bool>? _isScanningSubscription;
 
   @override
   void initState() {
@@ -1160,6 +1170,17 @@ class _ScanScreenState extends State<ScanScreen> {
       Permission.location
     ].request();
     
+    // Prüfe, ob GPS (Standort) am Handy physisch eingeschaltet ist.
+    // Falls nicht, zeige eine Warnung, da Android sonst keine BLE-Geräte findet.
+    if (!await Permission.location.serviceStatus.isEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Bitte aktiviere GPS/Standort, um die Maske zu finden!'),
+          backgroundColor: Colors.redAccent,
+        ));
+      }
+    }
+
     if (statuses[Permission.bluetoothScan]!.isGranted) {
       _startScan();
     }
@@ -1182,8 +1203,8 @@ class _ScanScreenState extends State<ScanScreen> {
   @override
   void dispose() { 
     FlutterBluePlus.stopScan(); 
-    _scanResultsSubscription.cancel(); 
-    _isScanningSubscription.cancel(); 
+    _scanResultsSubscription?.cancel(); 
+    _isScanningSubscription?.cancel(); 
     super.dispose(); 
   }
 
@@ -1232,7 +1253,7 @@ class _ScanScreenState extends State<ScanScreen> {
                     ScanResult result = _scanResults[index];
                     return ListTile(
                       leading: const Icon(Icons.bluetooth, color: Color(0xFF6C63FF)),
-                      title: Text(result.device.name.isEmpty ? 'Unbekanntes Gerät' : result.device.name),
+                      title: Text(result.device.platformName.isEmpty ? 'Unbekanntes Gerät' : result.device.platformName),
                       subtitle: Text(result.device.id.id),
                       trailing: ElevatedButton(
                         style: ElevatedButton.styleFrom(
@@ -1247,7 +1268,7 @@ class _ScanScreenState extends State<ScanScreen> {
                             Navigator.pop(context);
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
-                                content: Text('Verbunden mit ${result.device.name}'),
+                                content: Text('Verbunden mit ${result.device.platformName}'),
                                 backgroundColor: Colors.green,
                               )
                             );
@@ -1263,7 +1284,7 @@ class _ScanScreenState extends State<ScanScreen> {
                           Navigator.pop(context);
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
-                              content: Text('Verbunden mit ${result.device.name}'),
+                              content: Text('Verbunden mit ${result.device.platformName}'),
                               backgroundColor: Colors.green,
                             )
                           );
