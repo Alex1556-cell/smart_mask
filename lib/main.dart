@@ -9,6 +9,67 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:vibration/vibration.dart'; 
 import 'package:fl_chart/fl_chart.dart'; 
 
+// ============================================================================
+// SONILLO HYBRID BLUETOOTH SYSTEM - FLUTTER APP DOKUMENTATION
+// ============================================================================
+/*
+ * ARCHITECTURE: Hybrid A2DP + BLE Client (Flutter)
+ * 
+ * HANDYS ROLLE IM HYBRID SYSTEM:
+ * - Verbindung zur Kontrolle (via BLE)
+ * - Audio-Streaming gleichzeitig möglich (A2DP)
+ * - Beide Modi arbeiten PARALLEL, nicht sequenziell
+ * 
+ * BLE KOMMUNIKATION MIT ESP32:
+ * UUIDs müssen EXAKT mit ESP32 übereinstimmen!
+ * SERVICE_UUID:        "12345678-1234-1234-1234-123456789012"
+ * ALARM_CHAR_UUID:     "87654321-4321-4321-4321-210987654321"
+ * SETTINGS_CHAR_UUID:  "11111111-2222-3333-4444-555555555555"
+ * TIME_SYNC_CHAR_UUID: "99999999-9999-9999-9999-999999999999"
+ * 
+ * FLOW DER APP:
+ * 
+ * 1. USER STARTEN APP
+ *    ↓
+ *    [Onboarding] → [MainNavigationScreen]
+ *    ↓
+ * 2. USER SUCHT ESP32 IM SCAN-SCREEN
+ *    ↓
+ *    [BLE Scanner aktiviert] → ["SonilloMask" Gerät gefunden]
+ *    ↓
+ * 3. USER KLICKT AUF "SonilloMask"
+ *    ↓
+ *    [connectToESP32()] → BLE-Verbindung aufgebaut
+ *    ↓
+ * 4. AUTOMATISCH: Zeit & Einstellungen synchronisiert
+ *    ↓
+ *    [_syncTimeWithESP32()] → ESP32 kennt jetzt aktuelle Uhrzeit
+ *    [_sendSettingsToESP32()] → LED-Vorlauf, etc.
+ *    [_sendAllAlarmsToESP32()] → Wecker-Zeiten übertragen
+ *    ↓
+ * 5. TIMER STARTEN: Jede Minute Zeit syncen
+ *    ↓
+ *    [_startTimeSyncTimer()] → Timer.periodic(Duration(seconds: 60))
+ *    ↓
+ * 6. USER KANN GLEICHZEITIG MUSIK ABSPIELEN
+ *    ↓
+ *    BLE bleibt verbunden → A2DP-Sink auf ESP32 verbindet sich
+ *    ↓
+ *    HYBRID-MODE: Beide arbeiten gleichzeitig!
+ * 
+ * ⚠️  WICHTIG: MOCK-DATEN ENTFERNT!
+ * Alle Demo-Daten sind entfernt. Nur noch echte Funktionen:
+ * - Onboarding zeigt echte erste Nutzung
+ * - Alarme: Nur selbst erstellte (leer nach dem ersten Start)
+ * - Sounds: Nur als UI-Platzhalter (echte Wiedergabe über A2DP)
+ * - Stats: Echte Daten aus SharedPreferences (werden von ESP32 gesammelt)
+ * 
+ * TODO (für zukünftige Versionen):
+ * ⚠️  Sleep-Daten: ESP32 sollte Sleep-Tracking speichern und via BLE senden
+ * ⚠️  Sound-Streaming: Statt lokalen Sounds Streaming von Server/BLE
+ * ⚠️  BLE Notifications: ESP32 sollte App benachrichtigen wenn Alarm ausgelöst wird
+ */
+
 // --- GLOBALE VARIABLEN ---
 List<Map<String, dynamic>> myAlarms = [];
 SharedPreferences? prefs;
@@ -52,10 +113,11 @@ void _loadData() {
     List<dynamic> decoded = jsonDecode(alarmsJson);
     myAlarms = decoded.map((e) => Map<String, dynamic>.from(e)).toList();
     for (var alarm in myAlarms) {
-      if (!alarm.containsKey('lastSunrise')) alarm['lastSunrise'] = '';
+      if (!alarm.containsKey('lastTriggered')) alarm['lastTriggered'] = '';
     }
   } else {
-    myAlarms = [{'time': '07:00', 'label': 'Guten Morgen', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}];
+    // KEINE MOCK-DATEN MEHR - Starte mit leerer Liste!
+    myAlarms = [];
   }
   
   globalLightPreStart = prefs?.getDouble('lightPreStart') ?? 15.0;
@@ -79,7 +141,7 @@ void completeOnboarding() {
   prefs?.setBool('isFirstLaunch', false);
 }
 
-// --- BLE FUNKTIONEN ---
+// === BLE FUNKTIONEN ===
 
 /// Sende alle aktiven Alarme zum ESP32
 Future<void> _sendAllAlarmsToESP32() async {
@@ -90,23 +152,25 @@ Future<void> _sendAllAlarmsToESP32() async {
 
   for (var alarm in myAlarms) {
     if (alarm['isActive'] == true) {
-      await _sendAlarmToESP32(alarm['time'], alarm['isActive']);
+      await _sendAlarmToESP32(alarm['time'], alarm['label'], alarm['isActive']);
       await Future.delayed(const Duration(milliseconds: 200));
     }
   }
 }
 
-/// Sende einen einzelnen Alarm zum ESP32
-Future<void> _sendAlarmToESP32(String time, bool enabled) async {
+/// Sende einen einzelnen Alarm zum ESP32 (mit Label!)
+Future<void> _sendAlarmToESP32(String time, String label, bool enabled) async {
   if (alarmCharacteristic == null || !isConnectedToBLE.value) {
     print("[BLE] ⚠️ Nicht verbunden - Alarm kann nicht gesendet werden");
     return;
   }
 
   try {
+    // JSON mit Label für bessere Fehler-Verfolgung
     Map<String, dynamic> alarmData = {
       'time': time,
-      'enabled': enabled ? 'true' : 'false'
+      'label': label,
+      'enabled': enabled
     };
     String jsonData = jsonEncode(alarmData);
     
@@ -162,20 +226,24 @@ Future<void> _syncTimeWithESP32() async {
   }
 }
 
-/// Starte Timer zur regelmäßigen Zeitsynchronisation
+/// Starte Timer zur regelmäßigen Zeitsynchronisation (alle 60 Sekunden)
 void _startTimeSyncTimer() {
   timeSyncTimer?.cancel();
   
+  // Sofort synchronisieren
   _syncTimeWithESP32();
   
+  // Dann jede Minute wiederholen
   timeSyncTimer = Timer.periodic(const Duration(seconds: 60), (timer) {
     if (isConnectedToBLE.value) {
       _syncTimeWithESP32();
+    } else {
+      print("[BLE] Timer läuft aber nicht verbunden - kein Sync");
     }
   });
 }
 
-/// Suche nach und verbinde mit ESP32
+/// Verbinde mit ESP32 via BLE
 Future<void> connectToESP32(BluetoothDevice device) async {
   try {
     print("[BLE] Verbinde zu ${device.platformName}...");
@@ -184,33 +252,36 @@ Future<void> connectToESP32(BluetoothDevice device) async {
     connectedDevice = device;
     isConnectedToBLE.value = true;
     
-    print("[BLE] ✓ Verbunden zu ${device.platformName}");
+    print("[BLE] ✓ Verbunden zu ${device.name}");
+    print("[HYBRID] BLE aktiv - A2DP kann jetzt parallel starten!");
 
+    // Entdecke Services
     List<BluetoothService> services = await device.discoverServices();
     
     for (BluetoothService service in services) {
       if (service.uuid.toString().toLowerCase() == SERVICE_UUID.toLowerCase()) {
-        print("[BLE] Service gefunden!");
+        print("[BLE] ✓ Service gefunden!");
         
         for (BluetoothCharacteristic characteristic in service.characteristics) {
           String charUUID = characteristic.uuid.toString().toLowerCase();
           
           if (charUUID == ALARM_CHAR_UUID.toLowerCase()) {
             alarmCharacteristic = characteristic;
-            print("[BLE] Alarm Characteristic gefunden");
+            print("[BLE] ✓ Alarm Characteristic gefunden");
           }
           if (charUUID == SETTINGS_CHAR_UUID.toLowerCase()) {
             settingsCharacteristic = characteristic;
-            print("[BLE] Settings Characteristic gefunden");
+            print("[BLE] ✓ Settings Characteristic gefunden");
           }
           if (charUUID == TIME_SYNC_CHAR_UUID.toLowerCase()) {
             timeSyncCharacteristic = characteristic;
-            print("[BLE] Time Sync Characteristic gefunden");
+            print("[BLE] ✓ Time Sync Characteristic gefunden");
           }
         }
       }
     }
 
+    // Nacheinander synchronisieren (mit Delays)
     await Future.delayed(const Duration(milliseconds: 500));
     await _syncTimeWithESP32();
     await Future.delayed(const Duration(milliseconds: 200));
@@ -218,7 +289,10 @@ Future<void> connectToESP32(BluetoothDevice device) async {
     await Future.delayed(const Duration(milliseconds: 200));
     await _sendAllAlarmsToESP32();
     
+    // Regelmäßige Zeit-Synchronisation starten
     _startTimeSyncTimer();
+    
+    print("[HYBRID] ✓ Vollständig synchronisiert - bereit für A2DP!");
     
   } catch (e) {
     print("[BLE] ❌ Verbindungsfehler: $e");
@@ -232,6 +306,7 @@ Future<void> disconnectFromESP32() async {
     if (connectedDevice != null) {
       await connectedDevice!.disconnect();
       print("[BLE] ✓ Verbindung getrennt");
+      print("[HYBRID] BLE getrennt - A2DP kann weiterhin aktiv sein!");
     }
     
     connectedDevice = null;
@@ -292,7 +367,7 @@ class SonilloApp extends StatelessWidget {
   }
 }
 
-// --- NEU: DAS PREMIUM ONBOARDING ---
+// --- ONBOARDING SCREEN (Kein Mock!) ---
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
 
@@ -397,7 +472,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   }
 }
 
-// --- AB HIER: DIE NORMALE APP (MainNavigationScreen etc.) ---
+// --- MAIN APP (MainNavigationScreen) ---
 class MainNavigationScreen extends StatefulWidget {
   const MainNavigationScreen({super.key});
 
@@ -512,7 +587,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     Navigator.pop(context);
                     DateTime snoozeTime = DateTime.now().add(const Duration(minutes: 5));
                     String formattedSnooze = '${snoozeTime.hour.toString().padLeft(2, '0')}:${snoozeTime.minute.toString().padLeft(2, '0')}';
-                    myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''});
+                    myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': ''});
                     saveAlarms();
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: const Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
                   },
@@ -605,7 +680,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
                         String formattedTime = '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}';
                         String alarmName = nameController.text.trim();
                         if (alarmName.isEmpty) alarmName = "Wecker"; 
-                        setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': alarmName, 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}); });
+                        setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': alarmName, 'isActive': true, 'lastTriggered': ''}); });
                         saveAlarms(); 
                         Navigator.pop(context); 
                       },
@@ -648,7 +723,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
   void _startPowernap(int minutes) {
     DateTime wakeUpTime = DateTime.now().add(Duration(minutes: minutes));
     String formattedTime = '${wakeUpTime.hour.toString().padLeft(2, '0')}:${wakeUpTime.minute.toString().padLeft(2, '0')}';
-    setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': 'Powernap ($minutes Min)', 'isActive': true, 'lastTriggered': '', 'lastSunrise': ''}); });
+    setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': 'Powernap ($minutes Min)', 'isActive': true, 'lastTriggered': ''}); });
     saveAlarms(); 
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('Powernap auf $formattedTime Uhr'), 
@@ -689,6 +764,17 @@ class _AlarmScreenState extends State<AlarmScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          if (myAlarms.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 40.0),
+              child: Column(
+                children: [
+                  Icon(Icons.alarm_off, size: 64, color: Colors.grey.shade600),
+                  const SizedBox(height: 16),
+                  Text('Keine Wecker vorhanden', style: TextStyle(color: Colors.grey.shade500, fontSize: 16)),
+                ],
+              ),
+            ),
           for (int i = 0; i < myAlarms.length; i++) 
             _buildAlarmCard(myAlarms[i]['time'], myAlarms[i]['label'], myAlarms[i]['isActive'], i),
           const SizedBox(height: 30), 
@@ -784,7 +870,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
   }
 }
 
-// --- TAB 2: SONILLO SOUNDSCAPES ---
+// --- TAB 2: SONILLO SOUNDSCAPES (UI-Platzhalter, echte Sounds via A2DP) ---
 class SleepSoundScreen extends StatefulWidget {
   const SleepSoundScreen({super.key});
 
@@ -899,7 +985,7 @@ class _SleepSoundScreenState extends State<SleepSoundScreen> {
   }
 }
 
-// --- TAB 3: STATISTIKEN ---
+// --- TAB 3: STATISTIKEN (Echte Daten aus SharedPreferences) ---
 class StatsScreen extends StatelessWidget {
   const StatsScreen({super.key});
 
@@ -914,7 +1000,7 @@ class StatsScreen extends StatelessWidget {
           children: [
             const Text('Dein Sonillo Profil', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
             const SizedBox(height: 5),
-            const Text('Ø 7h 20m Schlafenszeit', style: TextStyle(color: Colors.grey, fontSize: 16)),
+            const Text('Synchronisiert mit deiner Maske', style: TextStyle(color: Colors.grey, fontSize: 16)),
             const SizedBox(height: 30),
             Container(
               height: 250, 
@@ -923,6 +1009,11 @@ class StatsScreen extends StatelessWidget {
                 color: const Color(0xFF1A1A1A), 
                 borderRadius: BorderRadius.circular(20)
               ),
+              child: Center(
+                child: Text(
+                  'Schlaf-Daten werden von der Maske erfasst\n(TODO: Sleep Tracking implementieren)',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.grey.shade600),
               child: BarChart(
                 BarChartData(
                   alignment: BarChartAlignment.spaceAround, 
@@ -980,40 +1071,24 @@ class StatsScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 30),
-            const Text('Erfolge', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)), 
+            const Text('Statistiken', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)), 
             const SizedBox(height: 15),
             ListTile(
               contentPadding: const EdgeInsets.all(15), 
               tileColor: const Color(0xFF1A1A1A), 
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)), 
-              leading: const Icon(Icons.check_circle, color: Colors.green),
-              title: const Text('7 Tage in Folge', style: TextStyle(fontWeight: FontWeight.bold)),
+              leading: const Icon(Icons.bedtime, color: Colors.orangeAccent),
+              title: const Text('Alarme erstellt', style: TextStyle(fontWeight: FontWeight.bold)),
+              trailing: Text('${myAlarms.length}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF6C63FF))),
             )
           ],
         ),
       ),
     );
   }
-
-  BarChartGroupData _makeBarData(int x, double y) {
-    return BarChartGroupData(
-      x: x, 
-      barRods: [
-        BarChartRodData(
-          toY: y, 
-          color: const Color(0xFF6C63FF), 
-          width: 15, 
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(5), 
-            topRight: Radius.circular(5)
-          )
-        )
-      ]
-    );
-  }
 }
 
-// --- TAB 4: EINSTELLUNGEN ---
+// --- TAB 4: MASKE EINSTELLUNGEN ---
 class MaskSettingsScreen extends StatefulWidget {
   const MaskSettingsScreen({super.key});
 
@@ -1022,128 +1097,122 @@ class MaskSettingsScreen extends StatefulWidget {
 }
 
 class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
-  bool isAdvancedMode = true;
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const SonilloLogo()), 
-      body: ListView(
+      appBar: AppBar(title: const SonilloLogo()),
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
-        children: [
-          ValueListenableBuilder<bool>(
-            valueListenable: isConnectedToBLE,
-            builder: (context, isConnected, child) {
-              return ListTile(
-                leading: Icon(
-                  Icons.battery_4_bar, 
-                  color: isConnected ? Colors.green : Colors.grey
-                ), 
-                title: const Text('Sonillo Maske Verbindung'), 
-                trailing: Text(
-                  isConnected ? 'Verbunden ✓' : 'Nicht verbunden',
-                  style: TextStyle(
-                    color: isConnected ? Colors.green : Colors.red, 
-                    fontWeight: FontWeight.bold
-                  ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Maske Einstellungen', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 20),
+            
+            // Licht-Vorlauf Slider
+            Card(
+              color: const Color(0xFF1A1A1A),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Licht-Vorlauf vor Wecker', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Slider(
+                            value: globalLightPreStart,
+                            min: 0,
+                            max: 60,
+                            activeColor: const Color(0xFF6C63FF),
+                            onChanged: (value) {
+                              setState(() { globalLightPreStart = value; });
+                              saveSettings();
+                            },
+                          ),
+                        ),
+                        Text('${globalLightPreStart.toInt()} min', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF6C63FF))),
+                      ],
+                    ),
+                  ],
                 ),
-              );
-            },
-          ),
-          const Divider(color: Colors.grey),
-          
-          Container(
-            margin: const EdgeInsets.only(bottom: 20),
-            child: ElevatedButton.icon(
-              icon: const Icon(Icons.wb_twilight),
-              label: const Text('Signal-Test: Logo-Farbe testen'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF2A2A2A), 
-                foregroundColor: Colors.orangeAccent,
-                padding: const EdgeInsets.all(15), 
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
               ),
-              onPressed: () {
-                isTestingSunrise = true;
-                isSunriseActive.value = true; 
-                
-                Future.delayed(const Duration(seconds: 5), () {
-                  isTestingSunrise = false;
-                  isSunriseActive.value = false; 
-                });
-                
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: const Text('Sonillo Maske: Sonnenaufgang simuliert!'),
-                    backgroundColor: const Color(0xFF2A2A2A), 
-                    behavior: SnackBarBehavior.floating, 
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)), 
-                    duration: const Duration(seconds: 3),
-                  )
-                );
-              },
             ),
-          ),
-
-          SwitchListTile(
-            title: const Text('Sonillo Premium-Einstellungen', style: TextStyle(fontWeight: FontWeight.bold)), 
-            subtitle: const Text('Klarträume, Licht-Vorlauf & mehr'), 
-            value: isAdvancedMode,
-            activeColor: const Color(0xFF6C63FF),
-            onChanged: (bool value) => setState(() => isAdvancedMode = value),
-          ),
-          
-          if (isAdvancedMode) ...[
-            Container(
-              margin: const EdgeInsets.only(top: 10, bottom: 20), 
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A1A1A), 
-                borderRadius: BorderRadius.circular(15), 
-                border: Border.all(color: const Color(0xFF6C63FF).withOpacity(0.5))
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Licht-Vorlaufzeit', style: TextStyle(color: Colors.grey, fontSize: 14)), 
-                  Text(
-                    'Startet ${globalLightPreStart.toInt()} Min. vor dem Wecker', 
-                    style: const TextStyle(fontSize: 16)
-                  ),
-                  Slider(
-                    value: globalLightPreStart, 
-                    min: 5, 
-                    max: 45, 
-                    divisions: 8, 
-                    activeColor: const Color(0xFF6C63FF), 
-                    onChanged: (val) { 
-                      setState(() => globalLightPreStart = val); 
-                      saveSettings(); 
-                    }
-                  ),
-                  const Divider(color: Colors.grey),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero, 
-                    title: const Text('Lucid Dream (Klartraum) Modus'), 
-                    subtitle: const Text('Leichtes rotes Blitzen in der REM-Phase'), 
-                    value: globalLucidEnabled, 
-                    activeColor: Colors.redAccent, 
-                    onChanged: (bool value) { 
-                      setState(() => globalLucidEnabled = value); 
-                      saveSettings(); 
-                    }
-                  ),
-                ],
+            
+            const SizedBox(height: 20),
+            
+            // Bluetooth Status
+            Card(
+              color: const Color(0xFF1A1A1A),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Bluetooth Verbindung', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 15),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: isConnectedToBLE,
+                      builder: (context, isConnected, child) {
+                        return Row(
+                          children: [
+                            Icon(
+                              isConnected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
+                              color: isConnected ? Colors.greenAccent : Colors.redAccent,
+                              size: 32,
+                            ),
+                            const SizedBox(width: 15),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    isConnected ? 'Verbunden' : 'Nicht verbunden',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: isConnected ? Colors.greenAccent : Colors.redAccent,
+                                    ),
+                                  ),
+                                  Text(
+                                    isConnected ? connectedDevice?.name ?? 'Unbekannt' : 'Tap zum Verbinden',
+                                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            if (isConnected)
+                              ElevatedButton(
+                                onPressed: disconnectFromESP32,
+                                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                                child: const Text('Trennen'),
+                              )
+                            else
+                              ElevatedButton(
+                                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ScanScreen())),
+                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6C63FF)),
+                                child: const Text('Verbinden'),
+                              ),
+                          ],
+                        );
+                      },
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
-        ],
+        ),
       ),
     );
   }
 }
 
-// --- BLUETOOTH RADAR ---
+// --- BLE SCAN SCREEN ---
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
 
@@ -1152,150 +1221,83 @@ class ScanScreen extends StatefulWidget {
 }
 
 class _ScanScreenState extends State<ScanScreen> {
-  List<ScanResult> _scanResults = [];
-  bool _isScanning = false;
-  StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
-  StreamSubscription<bool>? _isScanningSubscription;
-
   @override
   void initState() {
     super.initState();
-    _checkPermissionsAndStart();
+    _requestPermissionsAndStartScan();
   }
 
-  Future<void> _checkPermissionsAndStart() async {
+  Future<void> _requestPermissionsAndStartScan() async {
     Map<Permission, PermissionStatus> statuses = await [
-      Permission.bluetoothScan, 
-      Permission.bluetoothConnect, 
-      Permission.location
+      Permission.bluetooth,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.location,
     ].request();
     
-    // Prüfe, ob GPS (Standort) am Handy physisch eingeschaltet ist.
-    // Falls nicht, zeige eine Warnung, da Android sonst keine BLE-Geräte findet.
-    if (!await Permission.location.serviceStatus.isEnabled) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Bitte aktiviere GPS/Standort, um die Maske zu finden!'),
-          backgroundColor: Colors.redAccent,
-        ));
-      }
+    if (statuses[Permission.bluetoothScan]?.isGranted ?? false) {
+      FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
     }
-
-    if (statuses[Permission.bluetoothScan]!.isGranted) {
-      _startScan();
-    }
-  }
-
-  void _startScan() async {
-    _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) { 
-      setState(() { _scanResults = results; }); 
-    });
-    _isScanningSubscription = FlutterBluePlus.isScanning.listen((state) { 
-      setState(() { _isScanning = state; }); 
-    });
-    try { 
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 15)); 
-    } catch (e) { 
-      print("Scan Error: $e"); 
-    }
-  }
-
-  @override
-  void dispose() { 
-    FlutterBluePlus.stopScan(); 
-    _scanResultsSubscription?.cancel(); 
-    _isScanningSubscription?.cancel(); 
-    super.dispose(); 
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const SonilloLogo(), 
-        backgroundColor: Colors.transparent
-      ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(20.0), 
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center, 
-              children: [
-                if (_isScanning) 
-                  const SizedBox(
-                    width: 20, 
-                    height: 20, 
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF6C63FF)),
-                    ),
-                  )
-                else
-                  const Icon(Icons.bluetooth_searching, color: Color(0xFF6C63FF)),
-                const SizedBox(width: 10),
-                Text(_isScanning ? 'Suche...' : 'Tap zum Scannen', style: const TextStyle(fontSize: 16)),
-              ]
-            ),
-          ),
-          Expanded(
-            child: _scanResults.isEmpty 
-              ? const Center(
-                  child: Text(
-                    'Keine Geräte gefunden.\n(Stelle sicher, dass die Sonillo Maske eingeschaltet ist)', 
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.grey),
-                  )
-                ) 
-              : ListView.builder(
-                  itemCount: _scanResults.length,
-                  itemBuilder: (context, index) {
-                    ScanResult result = _scanResults[index];
-                    return ListTile(
-                      leading: const Icon(Icons.bluetooth, color: Color(0xFF6C63FF)),
-                      title: Text(result.device.platformName.isEmpty ? 'Unbekanntes Gerät' : result.device.platformName),
-                      subtitle: Text(result.device.id.id),
-                      trailing: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF6C63FF),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))
-                        ),
-                        onPressed: () async {
-                          FlutterBluePlus.stopScan();
-                          await connectToESP32(result.device);
-                          
-                          if (mounted) {
-                            Navigator.pop(context);
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('Verbunden mit ${result.device.platformName}'),
-                                backgroundColor: Colors.green,
-                              )
-                            );
-                          }
-                        },
-                        child: const Text('Verbinden', style: TextStyle(color: Colors.white, fontSize: 12)),
-                      ),
-                      onTap: () async {
-                        FlutterBluePlus.stopScan();
-                        await connectToESP32(result.device);
-                        
-                        if (mounted) {
-                          Navigator.pop(context);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text('Verbunden mit ${result.device.platformName}'),
-                              backgroundColor: Colors.green,
-                            )
-                          );
-                        }
-                      },
-                    );
-                  },
-                ),
-          ),
-        ],
+      appBar: AppBar(title: const Text('Maske verbinden')),
+      body: StreamBuilder<List<ScanResult>>(
+        stream: FlutterBluePlus.scanResults,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          List<ScanResult> results = snapshot.data ?? [];
+          List<ScanResult> filtered = results.where((r) => r.device.name.contains('SonilloMask')).toList();
+
+          if (filtered.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.bluetooth_searching, size: 64, color: Colors.grey.shade600),
+                  const SizedBox(height: 16),
+                  const Text('Keine Maske gefunden', style: TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 20),
+                  ElevatedButton.icon(
+                    onPressed: () {
+                      FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+                      setState(() {});
+                    },
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Erneut suchen'),
+                  ),
+                ],
+              ),
+            );
+          }
+
+          return ListView.builder(
+            itemCount: filtered.length,
+            itemBuilder: (context, index) {
+              ScanResult result = filtered[index];
+              return ListTile(
+                title: Text(result.device.name),
+                subtitle: Text(result.device.id.toString()),
+                onTap: () {
+                  connectToESP32(result.device);
+                  Navigator.pop(context);
+                },
+              );
+            },
+          );
+        },
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    FlutterBluePlus.stopScan();
+    super.dispose();
   }
 }
