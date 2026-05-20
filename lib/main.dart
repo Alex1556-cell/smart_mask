@@ -5,7 +5,7 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart'; 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart'; 
 import 'package:permission_handler/permission_handler.dart'; 
-import 'package:audioplayers/audioplayers.dart'; 
+import 'package:flutter_ringtone_player/flutter_ringtone_player.dart'; 
 import 'package:vibration/vibration.dart'; 
 import 'package:fl_chart/fl_chart.dart'; 
 
@@ -193,7 +193,7 @@ Future<void> _sendSettingsToESP32() async {
   try {
     Map<String, dynamic> settingsData = {
       'prestart': globalLightPreStart.toInt(),
-      'lucid': globalLucidEnabled ? 'true' : 'false'
+      'lucid': globalLucidEnabled
     };
     String jsonData = jsonEncode(settingsData);
     
@@ -246,13 +246,27 @@ void _startTimeSyncTimer() {
 /// Verbinde mit ESP32 via BLE
 Future<void> connectToESP32(BluetoothDevice device) async {
   try {
+    // FIX 1: 'platformName' statt 'name' verwenden
     print("[BLE] Verbinde zu ${device.platformName}...");
-    await device.connect(license: License.free);
-    
+
+    await device.connect(
+      license: License.free,
+      autoConnect: false,
+    ).timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        // WICHTIG: Nativer Verbindungsabbruch, da das Dart-Timeout allein
+        // den Verbindungsaufbau im Hintergrund (OS-Ebene) nicht stoppt!
+        device.disconnect();
+        throw TimeoutException("BLE Verbindung fehlgeschlagen (Timeout)");
+      },
+    );
+
+    // Diese Zeilen werden jetzt nur noch erreicht, wenn der connect VOR dem Timeout erfolgreich war
     connectedDevice = device;
     isConnectedToBLE.value = true;
-    
-    print("[BLE] ✓ Verbunden zu ${device.name}");
+
+    print("[BLE] ✓ Verbunden zu ${device.platformName}");
     print("[HYBRID] BLE aktiv - A2DP kann jetzt parallel starten!");
 
     // Entdecke Services
@@ -295,6 +309,7 @@ Future<void> connectToESP32(BluetoothDevice device) async {
     print("[HYBRID] ✓ Vollständig synchronisiert - bereit für A2DP!");
     
   } catch (e) {
+    // Hier landet der Code, wenn es nicht klappt oder das Timeout auslöst
     print("[BLE] ❌ Verbindungsfehler: $e");
     isConnectedToBLE.value = false;
   }
@@ -483,7 +498,6 @@ class MainNavigationScreen extends StatefulWidget {
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _currentIndex = 0;
   Timer? _heartbeat;
-  final AudioPlayer _audioPlayer = AudioPlayer();
 
   final List<Widget> _pages = [
     const AlarmScreen(), 
@@ -542,12 +556,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   }
 
   void _triggerAlarmScreen(String label) async {
-    // --- BULLETPROOF BLUETOOTH AUDIO ---
-    // Nutzt den Standard-Medienkanal (wie Spotify), was Android zwingt, 
-    // den Ton über den verbundenen ESP32 abzuspielen.
-    _audioPlayer.setReleaseMode(ReleaseMode.loop);
-    await _audioPlayer.play(AssetSource('audio/alarm.mp3'));
-
+    FlutterRingtonePlayer().playAlarm(looping: true, volume: 1.0);
     bool? hasVibrator = await Vibration.hasVibrator();
     if (hasVibrator == true) Vibration.vibrate(pattern: [500, 1000, 500, 1000], repeat: 1);
 
@@ -582,14 +591,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
                   ),
                   onPressed: () {
-                    _audioPlayer.stop();
+                    FlutterRingtonePlayer().stop();
                     Vibration.cancel();
                     Navigator.pop(context);
                     DateTime snoozeTime = DateTime.now().add(const Duration(minutes: 5));
                     String formattedSnooze = '${snoozeTime.hour.toString().padLeft(2, '0')}:${snoozeTime.minute.toString().padLeft(2, '0')}';
-                    myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': ''});
+                    setState(() { myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': ''}); });
                     saveAlarms();
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: const Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
                   },
                   label: const Text('5 Min Snooze', style: TextStyle(fontSize: 16)),
                 ),
@@ -604,7 +613,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
                   ),
                   onPressed: () {
-                    _audioPlayer.stop();
+                    FlutterRingtonePlayer().stop();
                     Vibration.cancel(); 
                     Navigator.pop(context);
                   },
@@ -621,7 +630,6 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   @override
   void dispose() { 
     _heartbeat?.cancel(); 
-    _audioPlayer.dispose();
     super.dispose(); 
   }
 
@@ -1014,59 +1022,6 @@ class StatsScreen extends StatelessWidget {
                   'Schlaf-Daten werden von der Maske erfasst\n(TODO: Sleep Tracking implementieren)',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.grey.shade600),
-              child: BarChart(
-                BarChartData(
-                  alignment: BarChartAlignment.spaceAround, 
-                  maxY: 10, 
-                  barTouchData: BarTouchData(enabled: false),
-                  titlesData: FlTitlesData(
-                    show: true, 
-                    bottomTitles: AxisTitles(
-                      sideTitles: SideTitles(
-                        showTitles: true, 
-                        getTitlesWidget: (double value, TitleMeta meta) {
-                          const style = TextStyle(color: Colors.grey, fontSize: 12);
-                          String text;
-                          switch (value.toInt()) { 
-                            case 0: text='Mo'; break; 
-                            case 1: text='Di'; break; 
-                            case 2: text='Mi'; break; 
-                            case 3: text='Do'; break; 
-                            case 4: text='Fr'; break; 
-                            case 5: text='Sa'; break;
-                            case 6: text='So'; break;
-                            default: text=''; break;
-                          }
-                          return SideTitleWidget(
-                           meta: meta, 
-                            child: Text(text, style: style),
-                          );
-                        },
-                      ),
-                    ),
-                    leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)), 
-                    topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)), 
-                    rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  ),
-                  gridData: FlGridData(
-                    show: true, 
-                    drawVerticalLine: false, 
-                    horizontalInterval: 2, 
-                    getDrawingHorizontalLine: (value) => FlLine(
-                      color: Colors.grey.withOpacity(0.2), 
-                      strokeWidth: 1
-                    )
-                  ),
-                  borderData: FlBorderData(show: false),
-                  barGroups: [
-                    _makeBarData(0, 6.5), 
-                    _makeBarData(1, 7.0), 
-                    _makeBarData(2, 5.5), 
-                    _makeBarData(3, 8.0), 
-                    _makeBarData(4, 7.5), 
-                    _makeBarData(5, 9.0), 
-                    _makeBarData(6, 8.5)
-                  ],
                 ),
               ),
             ),
@@ -1179,7 +1134,7 @@ class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
                                     ),
                                   ),
                                   Text(
-                                    isConnected ? connectedDevice?.name ?? 'Unbekannt' : 'Tap zum Verbinden',
+                                    isConnected ? connectedDevice?.platformName ?? 'Unbekannt' : 'Tap zum Verbinden',
                                     style: const TextStyle(color: Colors.grey, fontSize: 12),
                                   ),
                                 ],
@@ -1252,7 +1207,7 @@ class _ScanScreenState extends State<ScanScreen> {
           }
 
           List<ScanResult> results = snapshot.data ?? [];
-          List<ScanResult> filtered = results.where((r) => r.device.name.contains('SonilloMask')).toList();
+          List<ScanResult> filtered = results.where((r) => r.device.platformName.contains('SonilloMask')).toList();
 
           if (filtered.isEmpty) {
             return Center(
@@ -1281,8 +1236,8 @@ class _ScanScreenState extends State<ScanScreen> {
             itemBuilder: (context, index) {
               ScanResult result = filtered[index];
               return ListTile(
-                title: Text(result.device.name),
-                subtitle: Text(result.device.id.toString()),
+                title: Text(result.device.platformName),
+                subtitle: Text(result.device.remoteId.toString()),
                 onTap: () {
                   connectToESP32(result.device);
                   Navigator.pop(context);
