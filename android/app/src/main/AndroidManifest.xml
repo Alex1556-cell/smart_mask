@@ -4,7 +4,20 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
-    
+    <!-- Diesen Block kopieren und einfügen -->
+
+<!-- Bluetooth-Berechtigungen für Android 12+ -->
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+<!-- Legacy Bluetooth-Berechtigungen für ältere Android-Versionen -->
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+
+<!-- Standort-Berechtigung (wird für BLE-Scan auf manchen Versionen benötigt) -->
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+
     <application
         android:label="smart_mask"
         android:name="${applicationName}"

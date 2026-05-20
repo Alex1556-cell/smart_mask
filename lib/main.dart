@@ -97,6 +97,7 @@ const String TIME_SYNC_CHAR_UUID = "99999999-9999-9999-9999-999999999999";
 
 ValueNotifier<bool> isConnectedToBLE = ValueNotifier(false);
 Timer? timeSyncTimer;
+Function(String)? onAlarmTriggered; // Globaler Callback für den Wecker-Dialog
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -150,36 +151,27 @@ Future<void> _sendAllAlarmsToESP32() async {
     return;
   }
 
+  // Alle aktiven Alarme in einer Liste bündeln
+  List<Map<String, dynamic>> alarmsList = [];
   for (var alarm in myAlarms) {
     if (alarm['isActive'] == true) {
-      await _sendAlarmToESP32(alarm['time'], alarm['label'], alarm['isActive']);
-      await Future.delayed(const Duration(milliseconds: 200));
+      alarmsList.add({
+        'time': alarm['time'],
+        'label': alarm['label'],
+        'enabled': alarm['isActive']
+      });
     }
-  }
-}
-
-/// Sende einen einzelnen Alarm zum ESP32 (mit Label!)
-Future<void> _sendAlarmToESP32(String time, String label, bool enabled) async {
-  if (alarmCharacteristic == null || !isConnectedToBLE.value) {
-    print("[BLE] ⚠️ Nicht verbunden - Alarm kann nicht gesendet werden");
-    return;
   }
 
   try {
-    // JSON mit Label für bessere Fehler-Verfolgung
-    Map<String, dynamic> alarmData = {
-      'time': time,
-      'label': label,
-      'enabled': enabled
-    };
-    String jsonData = jsonEncode(alarmData);
+    String jsonData = jsonEncode(alarmsList);
     
     List<int> bytes = utf8.encode(jsonData);
     await alarmCharacteristic!.write(bytes, withoutResponse: false);
     
-    print("[BLE] ✓ Alarm gesendet: $jsonData");
+    print("[BLE] ✓ Alarme gesendet: $jsonData");
   } catch (e) {
-    print("[BLE] ❌ Fehler beim Senden des Alarms: $e");
+    print("[BLE] ❌ Fehler beim Senden der Alarme: $e");
   }
 }
 
@@ -266,6 +258,13 @@ Future<void> connectToESP32(BluetoothDevice device) async {
     connectedDevice = device;
     isConnectedToBLE.value = true;
 
+    try {
+      await device.requestMtu(512); // MTU hochsetzen für JSON Arrays
+      print("[BLE] MTU erfolgreich angehoben");
+    } catch (e) {
+      print("[BLE] MTU Request fehlgeschlagen: $e");
+    }
+
     print("[BLE] ✓ Verbunden zu ${device.platformName}");
     print("[HYBRID] BLE aktiv - A2DP kann jetzt parallel starten!");
 
@@ -282,6 +281,19 @@ Future<void> connectToESP32(BluetoothDevice device) async {
           if (charUUID == ALARM_CHAR_UUID.toLowerCase()) {
             alarmCharacteristic = characteristic;
             print("[BLE] ✓ Alarm Characteristic gefunden");
+
+            // Auf Alarm-Trigger vom ESP32 horchen
+            await alarmCharacteristic!.setNotifyValue(true);
+            alarmCharacteristic!.lastValueStream.listen((value) {
+              if (value.isNotEmpty) {
+                String decoded = utf8.decode(value);
+                if (decoded.startsWith("TRIGGER:")) {
+                  String label = decoded.substring(8);
+                  print("[BLE] 🔔 Wecker-Trigger vom ESP32 empfangen: $label");
+                  if (onAlarmTriggered != null) onAlarmTriggered!(label);
+                }
+              }
+            });
           }
           if (charUUID == SETTINGS_CHAR_UUID.toLowerCase()) {
             settingsCharacteristic = characteristic;
@@ -509,6 +521,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   @override
   void initState() {
     super.initState();
+    onAlarmTriggered = _triggerAlarmScreen; // Callback zuweisen
     _startHeartbeat(); 
   }
 
@@ -527,12 +540,6 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       for (var alarm in myAlarms) {
         if (alarm['isActive'] == true) {
           
-          if (alarm['time'] == currentTime && alarm['lastTriggered'] != todayStr) {
-            alarm['lastTriggered'] = todayStr;
-            saveAlarms();
-            _triggerAlarmScreen(alarm['label']);
-          }
-
           List<String> parts = alarm['time'].split(':');
           DateTime alarmDate = DateTime(now.year, now.month, now.day, int.parse(parts[0]), int.parse(parts[1]));
           
@@ -689,7 +696,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
                         String alarmName = nameController.text.trim();
                         if (alarmName.isEmpty) alarmName = "Wecker"; 
                         setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': alarmName, 'isActive': true, 'lastTriggered': ''}); });
-                        saveAlarms(); 
+                           _saveAlarmsWithCheck(); 
                         Navigator.pop(context); 
                       },
                       child: const Text('Speichern', style: TextStyle(color: Color(0xFF6C63FF), fontSize: 16, fontWeight: FontWeight.bold)),
@@ -728,25 +735,46 @@ class _AlarmScreenState extends State<AlarmScreen> {
     );
   }
 
+  // --- NEU: Prüft beim Speichern, ob die Maske verbunden ist und warnt den User ---
+  void _saveAlarmsWithCheck() {
+    saveAlarms();
+    if (!isConnectedToBLE.value) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('⚠️ Lokal gespeichert. Bitte im Tab "Maske" verbinden, um den Wecker an die Maske zu senden!'),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 4),
+        )
+      );
+    }
+  }
+
   void _startPowernap(int minutes) {
     DateTime wakeUpTime = DateTime.now().add(Duration(minutes: minutes));
     String formattedTime = '${wakeUpTime.hour.toString().padLeft(2, '0')}:${wakeUpTime.minute.toString().padLeft(2, '0')}';
     setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': 'Powernap ($minutes Min)', 'isActive': true, 'lastTriggered': ''}); });
     saveAlarms(); 
+    
+    // Dynamische Nachricht je nach Verbindungsstatus
+    String msg = isConnectedToBLE.value 
+        ? 'Powernap auf $formattedTime Uhr an Maske gesendet' 
+        : 'Powernap lokal. Bitte Maske im Tab "Maske" verbinden!';
+    Color bgColor = isConnectedToBLE.value ? const Color(0xFF6C63FF) : Colors.orange;
+    
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('Powernap auf $formattedTime Uhr'), 
-      backgroundColor: const Color(0xFF6C63FF)
+      content: Text(msg), 
+      backgroundColor: bgColor
     ));
   }
 
   void _toggleAlarm(int index, bool newValue) { 
     setState(() { myAlarms[index]['isActive'] = newValue; }); 
-    saveAlarms(); 
+    _saveAlarmsWithCheck(); 
   }
 
   void _deleteAlarm(int index) { 
     setState(() { myAlarms.removeAt(index); }); 
-    saveAlarms(); 
+    _saveAlarmsWithCheck(); 
   }
 
   @override
