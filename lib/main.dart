@@ -88,12 +88,18 @@ BluetoothDevice? connectedDevice;
 BluetoothCharacteristic? alarmCharacteristic;
 BluetoothCharacteristic? settingsCharacteristic;
 BluetoothCharacteristic? timeSyncCharacteristic;
+BluetoothCharacteristic? logCharacteristic; // NEU: Für Debug-Logs vom ESP32
 
 // BLE UUIDs (müssen mit ESP32 übereinstimmen!)
 const String SERVICE_UUID = "12345678-1234-1234-1234-123456789012";
 const String ALARM_CHAR_UUID = "87654321-4321-4321-4321-210987654321";
 const String SETTINGS_CHAR_UUID = "11111111-2222-3333-4444-555555555555";
+const String LOG_CHAR_UUID = "88888888-3333-3333-3333-888888888888"; // RICHTIG: Muss mit ESP32 übereinstimmen
 const String TIME_SYNC_CHAR_UUID = "99999999-9999-9999-9999-999999999999";
+
+// NEU: Log-Liste für Debugging
+List<String> espLogs = [];
+const int MAX_LOGS = 50; // Begrenzen um RAM zu sparen
 
 ValueNotifier<bool> isConnectedToBLE = ValueNotifier(false);
 Timer? timeSyncTimer;
@@ -303,6 +309,29 @@ Future<void> connectToESP32(BluetoothDevice device) async {
             timeSyncCharacteristic = characteristic;
             print("[BLE] ✓ Time Sync Characteristic gefunden");
           }
+          
+          // NEU: Log Characteristic finden und Notifications abonnieren
+          if (charUUID == LOG_CHAR_UUID.toLowerCase()) {
+            logCharacteristic = characteristic;
+            print("[BLE] ✓ Log Characteristic gefunden");
+            
+            // Aktiviere Notifications
+            await logCharacteristic!.setNotifyValue(true);
+            
+            // Horche auf Log-Nachrichten vom ESP32
+            logCharacteristic!.lastValueStream.listen((value) {
+              if (value.isNotEmpty) {
+                String decoded = utf8.decode(value);
+                print("[ESP_LOG] $decoded");
+                
+                // Speichere Log in Liste (begrenzt)
+                espLogs.add("[${DateTime.now().toString().substring(11, 19)}] $decoded");
+                if (espLogs.length > MAX_LOGS) {
+                  espLogs.removeAt(0);
+                }
+              }
+            });
+          }
         }
       }
     }
@@ -340,6 +369,7 @@ Future<void> disconnectFromESP32() async {
     alarmCharacteristic = null;
     settingsCharacteristic = null;
     timeSyncCharacteristic = null;
+    logCharacteristic = null;
     isConnectedToBLE.value = false;
     
     timeSyncTimer?.cancel();
@@ -512,10 +542,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   Timer? _heartbeat;
 
   final List<Widget> _pages = [
-    const AlarmScreen(), 
-    const SleepSoundScreen(), 
-    const StatsScreen(), 
-    const MaskSettingsScreen(),
+    AlarmScreen(), // AlarmScreen ist StatefulWidget - const entfernt
+    SleepSoundScreen(),
+    StatsScreen(), // StatsScreen ist StatelessWidget - const hinzugefügt
+    MaskSettingsScreen(),
   ];
 
   @override
@@ -654,10 +684,108 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Maske'),
         ],
       ),
+      // NEU: Debug Panel als FloatingActionButton
+      floatingActionButton: FloatingActionButton(
+        mini: true,
+        backgroundColor: Colors.grey[800],
+        onPressed: () => _showDebugPanel(),
+        tooltip: 'ESP32 Debug-Logs anzeigen',
+        child: const Icon(Icons.bug_report, color: Colors.amber),
+      ),
+    );
+  }
+
+  void _showDebugPanel() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1A1A1A),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+          title: const Row(
+            children: [
+              Icon(Icons.bug_report, color: Colors.amber),
+              SizedBox(width: 10),
+              Text('ESP32 Debug-Logs', style: TextStyle(color: Colors.white, fontSize: 18)),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 400,
+            child: Column(
+              children: [
+                Expanded(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0A0A0A),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.amber, width: 0.5),
+                    ),
+                    padding: const EdgeInsets.all(12),
+                    child: espLogs.isEmpty
+                        ? const Center(
+                            child: Text(
+                              'Keine Logs vorhanden\nWarte auf Wecker-Trigger oder Änderungen...',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.grey, fontSize: 14),
+                            ),
+                          )
+                        : ListView.builder(
+                            itemCount: espLogs.length,
+                            itemBuilder: (context, index) {
+                              final log = espLogs[index];
+                              final isAlarmTrigger = log.contains('TRIGGER');
+                              final isSync = log.contains('SYNC');
+                              
+                              Color textColor = Colors.grey;
+                              if (isAlarmTrigger) textColor = Colors.redAccent;
+                              if (isSync) textColor = Colors.greenAccent;
+                              if (log.contains('ERROR')) textColor = Colors.redAccent;
+                              
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: Text(
+                                  log,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 12,
+                                    color: textColor,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.clear),
+                      label: const Text('Löschen'),
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[700]),
+                      onPressed: () {
+                        setState(() => espLogs.clear());
+                        Navigator.pop(context);
+                      },
+                    ),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.close),
+                      label: const Text('Schließen'),
+                      style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6C63FF)),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
-
 // --- TAB 1: DER WECKER ---
 class AlarmScreen extends StatefulWidget {
   const AlarmScreen({super.key});
@@ -669,7 +797,7 @@ class AlarmScreen extends StatefulWidget {
 class _AlarmScreenState extends State<AlarmScreen> {
   void _showIOSStyleTimePicker() {
     DateTime selectedTime = DateTime.now();
-    TextEditingController nameController = TextEditingController(text: 'Neuer Wecker');
+    final TextEditingController nameController = TextEditingController(text: 'Neuer Wecker');
 
     showDialog(
       context: context,
@@ -693,7 +821,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
                     TextButton(
                       onPressed: () {
                         String formattedTime = '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}';
-                        String alarmName = nameController.text.trim();
+                        String alarmName = nameController.text.trim(); // Lokale Variable, kein const nötig
                         if (alarmName.isEmpty) alarmName = "Wecker"; 
                         setState(() { myAlarms.insert(0, {'time': formattedTime, 'label': alarmName, 'isActive': true, 'lastTriggered': ''}); });
                            _saveAlarmsWithCheck(); 
@@ -789,9 +917,9 @@ class _AlarmScreenState extends State<AlarmScreen> {
               return IconButton(
                 icon: Icon(
                   Icons.bluetooth_searching, 
-                  color: isConnected ? Colors.greenAccent : const Color(0xFF6C63FF)
+                  color: isConnected ? Colors.greenAccent : const Color(0xFF6C63FF) // const Color ist hier korrekt
                 ), 
-                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ScanScreen()))
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => ScanScreen())) // const entfernt
               );
             },
           )
@@ -895,7 +1023,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
               ),
               Switch(
                 value: isActive, 
-                activeColor: const Color(0xFF6C63FF), 
+                activeThumbColor: const Color(0xFF6C63FF), 
                 onChanged: (val) => _toggleAlarm(index, val)
               ),
             ],
@@ -908,7 +1036,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
 
 // --- TAB 2: SONILLO SOUNDSCAPES (UI-Platzhalter, echte Sounds via A2DP) ---
 class SleepSoundScreen extends StatefulWidget {
-  const SleepSoundScreen({super.key});
+  SleepSoundScreen({super.key}); // const entfernt
 
   @override
   State<SleepSoundScreen> createState() => _SleepSoundScreenState();
@@ -1023,7 +1151,7 @@ class _SleepSoundScreenState extends State<SleepSoundScreen> {
 
 // --- TAB 3: STATISTIKEN (Echte Daten aus SharedPreferences) ---
 class StatsScreen extends StatelessWidget {
-  const StatsScreen({super.key});
+  StatsScreen({super.key}); // const entfernt
 
   @override
   Widget build(BuildContext context) {
@@ -1073,7 +1201,7 @@ class StatsScreen extends StatelessWidget {
 
 // --- TAB 4: MASKE EINSTELLUNGEN ---
 class MaskSettingsScreen extends StatefulWidget {
-  const MaskSettingsScreen({super.key});
+  MaskSettingsScreen({super.key}); // const entfernt (nochmal sicherstellen)
 
   @override
   State<MaskSettingsScreen> createState() => _MaskSettingsScreenState();
@@ -1176,7 +1304,7 @@ class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
                               )
                             else
                               ElevatedButton(
-                                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ScanScreen())),
+                                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) =>  ScanScreen())),
                                 style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6C63FF)),
                                 child: const Text('Verbinden'),
                               ),
@@ -1197,7 +1325,7 @@ class _MaskSettingsScreenState extends State<MaskSettingsScreen> {
 
 // --- BLE SCAN SCREEN ---
 class ScanScreen extends StatefulWidget {
-  const ScanScreen({super.key});
+  ScanScreen({super.key}); // const entfernt (nochmal sicherstellen)
 
   @override
   State<ScanScreen> createState() => _ScanScreenState();
@@ -1210,6 +1338,7 @@ class _ScanScreenState extends State<ScanScreen> {
     _requestPermissionsAndStartScan();
   }
 
+  // Methode vor initState verschoben
   Future<void> _requestPermissionsAndStartScan() async {
     Map<Permission, PermissionStatus> statuses = await [
       Permission.bluetooth,
