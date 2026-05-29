@@ -592,77 +592,91 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     });
   }
 
-  void _triggerAlarmScreen(String label) async {
-    FlutterRingtonePlayer().playAlarm(looping: true, volume: 1.0);
-    bool? hasVibrator = await Vibration.hasVibrator();
-    if (hasVibrator == true) Vibration.vibrate(pattern: [500, 1000, 500, 1000], repeat: 1);
+  
+  bool _isAlarmDialogActive = false; // Neu: Merkt sich den State
 
-    if (!mounted) return;
-    showDialog(
-      context: context, 
-      barrierDismissible: false, 
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A), 
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Column(
-          children: [
-            const SonilloLogo(), 
-            const SizedBox(height: 20),
-            const Icon(Icons.alarm_on, color: Color(0xFF6C63FF), size: 50), 
-            const SizedBox(height: 10),
-            const Text('WAKE UP!', style: TextStyle(color: Color(0xFF6C63FF), fontSize: 28, fontWeight: FontWeight.bold)),
-          ],
-        ),
-        content: Text('Dein Wecker "$label" klingelt!', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 18)),
-        actions: [
-          Column(
-            children: [
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  icon: const Icon(Icons.snooze),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white, 
-                    side: const BorderSide(color: Colors.grey), 
-                    padding: const EdgeInsets.symmetric(vertical: 15), 
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
-                  ),
-                  onPressed: () {
-                    FlutterRingtonePlayer().stop();
-                    Vibration.cancel();
-                    Navigator.pop(context);
-                    DateTime snoozeTime = DateTime.now().add(const Duration(minutes: 5));
-                    String formattedSnooze = '${snoozeTime.hour.toString().padLeft(2, '0')}:${snoozeTime.minute.toString().padLeft(2, '0')}';
-                    setState(() { myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': ''}); });
-                    saveAlarms();
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
-                  },
-                  label: const Text('5 Min Snooze', style: TextStyle(fontSize: 16)),
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF6C63FF), 
-                    padding: const EdgeInsets.symmetric(vertical: 15), 
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
-                  ),
-                  onPressed: () {
-                    FlutterRingtonePlayer().stop();
-                    Vibration.cancel(); 
-                    Navigator.pop(context);
-                  },
-                  child: const Text('Ausschalten', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-                ),
-              ),
-            ],
-          )
+void _triggerAlarmScreen(String label) async {
+  _isAlarmDialogActive = true;
+
+  // Der ESP32-Speaker läuft bereits. Wir warten 10 Sekunden, 
+  // bevor das Handy seinen eigenen lauten Ton hinzufügt.
+  Future.delayed(const Duration(seconds: 10), () async {
+    if (_isAlarmDialogActive && mounted) {
+      FlutterRingtonePlayer().playAlarm(looping: true, volume: 1.0);
+      bool? hasVibrator = await Vibration.hasVibrator();
+      if (hasVibrator == true) Vibration.vibrate(pattern: [500, 1000, 500, 1000], repeat: 1);
+    }
+  });
+
+  if (!mounted) return;
+  showDialog(
+    context: context, 
+    barrierDismissible: false, 
+    builder: (context) => AlertDialog(
+      backgroundColor: const Color(0xFF1A1A1A), 
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      title: Column(
+        children: [
+          const SonilloLogo(), 
+          const SizedBox(height: 20),
+          const Icon(Icons.alarm_on, color: Color(0xFF6C63FF), size: 50), 
+          const SizedBox(height: 10),
+          const Text('WAKE UP!', style: TextStyle(color: Color(0xFF6C63FF), fontSize: 28, fontWeight: FontWeight.bold)),
         ],
-      )
-    );
-  }
+      ),
+      content: Text('Dein Wecker "$label" klingelt!', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 18)),
+      actions: [
+        Column(
+          children: [
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.snooze),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white, 
+                  side: const BorderSide(color: Colors.grey), 
+                  padding: const EdgeInsets.symmetric(vertical: 15), 
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                ),
+                onPressed: () {
+                  _isAlarmDialogActive = false; // Verhindert, dass der Ton noch startet
+                  FlutterRingtonePlayer().stop();
+                  Vibration.cancel();
+                  Navigator.pop(context);
+                  
+                  DateTime snoozeTime = DateTime.now().add(const Duration(minutes: 5));
+                  String formattedSnooze = '${snoozeTime.hour.toString().padLeft(2, '0')}:${snoozeTime.minute.toString().padLeft(2, '0')}';
+                  setState(() { myAlarms.insert(0, {'time': formattedSnooze, 'label': 'Snooze ($label)', 'isActive': true, 'lastTriggered': ''}); });
+                  saveAlarms();
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Snooze aktiviert: Noch 5 Minuten! 💤')));
+                },
+                label: const Text('5 Min Snooze', style: TextStyle(fontSize: 16)),
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF6C63FF), 
+                  padding: const EdgeInsets.symmetric(vertical: 15), 
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                ),
+                onPressed: () {
+                  _isAlarmDialogActive = false; // Verhindert, dass der Ton noch startet
+                  FlutterRingtonePlayer().stop();
+                  Vibration.cancel(); 
+                  Navigator.pop(context);
+                },
+                child: const Text('Ausschalten', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              ),
+            ),
+          ],
+        )
+      ],
+    )
+  );
+}
 
   @override
   void dispose() { 
